@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <config.h>
 #include <numbers>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include "logger.h"
 
@@ -12,9 +15,14 @@ namespace math {
 
 using Scalar = double;
 constexpr Scalar kPi = std::numbers::pi_v<Scalar>;
-constexpr double kEps = 1e-12;
-constexpr Scalar kWorldHeight = 2000.0;
-constexpr Scalar kWorldWidth = 2000.0;
+
+/// Малый зазор, отнимаемый от радиуса свободной окружности, чтобы она
+/// гарантированно не касалась занятых кругов (строгая непересекаемость).
+constexpr Scalar kFreeCircleMargin = 1e-6;
+
+constexpr Scalar kEps = 1e-12;
+constexpr Scalar kHalfWorldWidth = world::kDefaultWidth * 0.5;
+constexpr Scalar kHalfWorldHeight = world::kDefaultHeight * 0.5;
 
 struct Vector2D {
     Scalar x = 0;
@@ -58,6 +66,26 @@ struct Vector2D {
     /// Для вектора нулевой длины возвращается нулевой вектор.
     [[nodiscard]] Vector2D normalized() const;
 };
+
+/// Окружность на плоскости: центр и радиус.
+struct Circle {
+    Vector2D center;
+    Scalar radius = 0.0;
+};
+/// Bottom-left corner: (-width/2, -height/2).
+[[nodiscard]] inline Vector2D worldMin() noexcept {
+    return {-kHalfWorldWidth, -kHalfWorldHeight};
+}
+
+/// Top-right corner: (+width/2, +height/2).
+[[nodiscard]] inline Vector2D worldMax() noexcept {
+    return {kHalfWorldWidth, kHalfWorldHeight};
+}
+
+/// Center — origin by convention.
+[[nodiscard]] inline Vector2D worldCenter() noexcept {
+    return {};
+}
 
 /// Wraps an angle in radians into (-pi, pi]; exactly -pi folds to +pi.
 /// \param angle_rad angle in radians, any magnitude
@@ -142,8 +170,8 @@ inline void updateShipPhysics(Vector2D& position,
 /// «мёртвой зоны» вблизи края и обратного притягивания.
 /// \pre world_width > 0, world_height > 0
 [[nodiscard]] inline Vector2D clampToWorldBounds(const Vector2D& position,
-                                                 Scalar world_width = kWorldWidth,
-                                                 Scalar world_height = kWorldHeight) noexcept {
+                                                 Scalar world_width = world::kDefaultWidth,
+                                                 Scalar world_height = world::kDefaultHeight) noexcept {
     const Scalar half_w = world_width * static_cast<Scalar>(0.5) - kEps;
     const Scalar half_h = world_height * static_cast<Scalar>(0.5) - kEps;
 
@@ -157,6 +185,182 @@ inline void updateShipPhysics(Vector2D& position,
 // принимаются строго как double (Scalar); int/float и т.п. — ошибка компиляции.
 template <typename T1, typename T2>
 Vector2D clampToWorldBounds(const Vector2D&, T1, T2) = delete;
+
+/// Возвращает одну из достаточно больших свободных окружностей целиком лежащую внутри прямоугольника
+/// [-world_width/2, world_width/2] x [-world_height/2, world_height/2] и не
+/// пересекающуюся и не касающуюся ни одного «занятого» круга.
+///
+/// Входные круги описываются парами (center, radius), где radius >= 0.
+/// Свободная окружность радиуса R с центром C допустима, если:
+///   |C.x| + R <= world_width/2   и   |C.y| + R <= world_height/2
+///   и для каждого занятого круга: |C - center_i| >= R + radius_i  (без касания).
+///
+/// Кандидаты в центр наибольшей пустой окружности — это вершины аддитивно-взвешенной
+/// диаграммы Вороного занятых кругов и границ мира:
+///   - вершина на прямой между каждой парой центров (учёт разных радиусов),
+///   - оптимальная точка на каждом ребре мира, равноудалённая от ребра и от каждого
+///     круга (перпендикуляр из центра круга к ребру),
+///   - центр мира как запасной кандидат.
+/// Для каждого кандидата вычисляется максимально допустимый радиус, выбирается максимум;
+/// при равенстве радиусов отдаётся центр ближе к началу координат.
+/// Итоговый радиус уменьшается на kFreeCircleMargin, чтобы окружность гарантированно
+/// не касалась сущностей (строгая непересекаемость).
+///
+/// \pre world_width > 0, world_height > 0; все radii >= 0
+/// \return Окружность максимального радиуса; при отсутствии занятых кругов — вписанная
+///         в мир окружность с центром в (0,0).
+[[nodiscard]] inline Circle largestEmptyCircle(const std::vector<std::pair<Vector2D, Scalar>>& occupied,
+                                               Scalar world_width,
+                                               Scalar world_height) {
+    const Scalar half_w = world_width * static_cast<Scalar>(0.5);
+    const Scalar half_h = world_height * static_cast<Scalar>(0.5);
+
+    // Для данного центра — радиус наибольшей свободной окружности.
+    const auto maxRadiusAt = [&](const Vector2D& center) {
+        Scalar r = std::min(half_w - std::fabs(center.x), half_h - std::fabs(center.y));
+        for (const auto& [pos, rad] : occupied) {
+            const Scalar sqr_d = (center - pos).lengthSquared();
+            const Scalar r_plus_rad = r + rad;
+            if (sqr_d < r_plus_rad * r_plus_rad) {
+                const Scalar d = std::sqrt(sqr_d) - rad;
+                if (d < r)
+                    r = d;
+            }
+        }
+        return std::max(r, static_cast<Scalar>(0.0));
+    };
+
+    // Пустой мир: вписанная в мир окружность.
+    if (occupied.empty()) {
+        return Circle{Vector2D{0.0, 0.0}, std::min(half_w, half_h)};
+    }
+
+    Circle best{Vector2D{0.0, 0.0}, -1.0};
+
+    const auto consider = [&](const Vector2D& center) {
+        const Scalar r = maxRadiusAt(center);
+        if (r > best.radius + kEps ||
+            (std::fabs(r - best.radius) <= kEps && center.lengthSquared() < best.center.lengthSquared())) {
+            best = Circle{center, r};
+        }
+    };
+
+    for (std::size_t i = 0; i < occupied.size(); ++i) {
+        const auto& [pa, ra] = occupied[i];
+
+        // Вершины Вороного вдоль линии пар центров (учёт разных радиусов).
+        for (std::size_t j = i + 1; j < occupied.size(); ++j) {
+            const auto& [pb, rb] = occupied[j];
+            const Vector2D delta = pb - pa;
+            const Scalar dist = delta.length();
+            if (dist < kEps) {
+                continue;
+            }
+            const Vector2D dir = delta * (1.0 / dist);
+
+            // Внутренняя вершина: |C - A| - ra = |C - B| - rb,
+            // причём |C - A| + |C - B| = dist => |C - A| = (dist + ra - rb)/2.
+            const Scalar t = (dist + ra - rb) * static_cast<Scalar>(0.5);
+            if (t >= 0.0 && t <= dist) {
+                consider(pa + dir * t);
+            }
+
+            // Внешние вершины за пределами отрезка AB.
+            consider(pa - dir * ra);
+            consider(pb + dir * rb);
+        }
+
+        // Оптимум «круг против каждого ребра мира»: точка на перпендикуляре из центра
+        // круга к ребру, равноудалённая от ребра и от круга. Здесь R = (зазор - ra)/2,
+        // а центр лежит на расстоянии R + ra от центра круга в сторону ребра.
+        // Правое ребро (x = +half_w).
+        consider(Vector2D{pa.x + ((half_w - pa.x + ra) * static_cast<Scalar>(0.5)), pa.y});
+        // Левое ребро (x = -half_w).
+        consider(Vector2D{pa.x - ((half_w + pa.x + ra) * static_cast<Scalar>(0.5)), pa.y});
+        // Верхнее ребро (y = +half_h).
+        consider(Vector2D{pa.x, pa.y + ((half_h - pa.y + ra) * static_cast<Scalar>(0.5))});
+        // Нижнее ребро (y = -half_h).
+        consider(Vector2D{pa.x, pa.y - ((half_h + pa.y + ra) * static_cast<Scalar>(0.5))});
+    }
+
+    // Запасной кандидат — центр мира.
+    consider(Vector2D{0.0, 0.0});
+
+    if (best.radius < 0.0) {
+        best = Circle{Vector2D{0.0, 0.0}, 0.0};
+    }
+
+    // Гарантия строгой непересекаемости: отступаем от касания на малый зазор,
+    // чтобы окружность не соприкасалась с сущностями.
+    best.radius = std::max(static_cast<Scalar>(0.0), best.radius - kFreeCircleMargin);
+    return best;
+}
+
+// Возвращает true, если круг касается или пересекает обе противоположные
+// границы мира: левую и правую либо верхнюю и нижнюю. Границы — конечные
+// отрезки с центром в начале координат.
+// Логирует ошибку и возвращает false, если положение, радиус или размеры мира некорректны.
+[[nodiscard]] inline bool circleIntersectsOppositeWorldBounds(const Vector2D& position,
+                                                              Scalar radius,
+                                                              Scalar world_width = world::kDefaultWidth,
+                                                              Scalar world_height = world::kDefaultHeight) {
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(radius) || radius < 0.0) {
+        LOG_ERROR("Position and radius must be finite, and radius non-negative");
+        return false;
+    }
+    if (!std::isfinite(world_width) || !std::isfinite(world_height) || world_width <= 0.0 || world_height <= 0.0) {
+        LOG_ERROR("World dimensions must be finite and positive");
+        return false;
+    }
+
+    const Scalar half_width = world_width * 0.5;
+    const Scalar half_height = world_height * 0.5;
+    const Scalar nearest_y = std::clamp(position.y, -half_height, half_height);
+    const Scalar nearest_x = std::clamp(position.x, -half_width, half_width);
+    const Scalar radius_squared = radius * radius;
+
+    const Vector2D to_left = position - Vector2D{-half_width, nearest_y};
+    const Vector2D to_right = position - Vector2D{half_width, nearest_y};
+    const Vector2D to_bottom = position - Vector2D{nearest_x, -half_height};
+    const Vector2D to_top = position - Vector2D{nearest_x, half_height};
+
+    const bool intersects_left = to_left.lengthSquared() <= radius_squared;
+    const bool intersects_right = to_right.lengthSquared() <= radius_squared;
+    const bool intersects_bottom = to_bottom.lengthSquared() <= radius_squared;
+    const bool intersects_top = to_top.lengthSquared() <= radius_squared;
+    return (intersects_left && intersects_right) || (intersects_bottom && intersects_top);
+}
+
+/// Wraps a circle of radius `radius` through an origin-centered rectangle
+/// with full extents (world_width, world_height). Once the circle is fully
+/// past one edge, its center is placed so the opposite edge of the circle
+/// touches the world boundary; it then slides back in.
+/// \pre radius >= 0, world_width > 0, world_height > 0
+[[nodiscard]] inline Vector2D wrapCircleThroughWorldBounds(const Vector2D& position,
+                                                           Scalar radius,
+                                                           Scalar world_width = world::kDefaultWidth,
+                                                           Scalar world_height = world::kDefaultHeight) noexcept {
+    const Scalar half_w = world_width * static_cast<Scalar>(0.5);
+    const Scalar half_h = world_height * static_cast<Scalar>(0.5);
+
+    Vector2D out = position;
+
+    if (out.x + radius < -half_w)
+        out.x = half_w + radius;
+    else if (out.x - radius > half_w)
+        out.x = -half_w - radius;
+
+    if (out.y + radius < -half_h)
+        out.y = half_h + radius;
+    else if (out.y - radius > half_h)
+        out.y = -half_h - radius;
+
+    return out;
+}
+
+// Запрет неявных преобразований
+template <typename T1, typename T2>
+Vector2D wrapCircleThroughWorldBounds(const Vector2D&, Scalar, T1, T2) = delete;
 
 namespace collision {
 
