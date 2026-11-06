@@ -8,11 +8,11 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "asteroid_factory.h"
 #include "config.h"
 #include "entity_pool.h"
 #include "event_bus.h"
@@ -22,13 +22,14 @@
 #include "thread_safe_queue.h"
 #include "types.h"
 
-enum class ActionType { PlayerJoin, PlayerQuit, MoveAndShoot, Respawn };
+enum class ActionType { Unknown, PlayerJoin, PlayerQuit, MoveAndShoot, Respawn };
 
 struct ActionEvent {
     SessionId session_id{};
-    ActionType type{ActionType::PlayerJoin};
+    ActionType type{ActionType::Unknown};
     math::Vector2D move_direction{};
     math::Vector2D target_point{};
+    double angle{};
     bool is_shooting{false};
     std::string player_name{};
 };
@@ -50,12 +51,7 @@ struct ActionEvent {
  *         доступно только внутри doTick(). start()/stop() лишь помещают работу
  *         на strand и возвращаются немедленно.
  *       - enqueueAction(), currentTick() безопасны для вызова
- *         выполнение шагов тика) сериализованы через tick_strand_.
- *         start()/stop() лишь помещают работу на strand и возвращаются немедленно.
- *       - enqueueAction(), currentTick(), lastSnapshot() безопасны для вызова
  *         из любых потоков.
- *       - entities_ защищён shared_mutex: тик изменяет его эксклюзивно,
- *         freePositions() читает под разделяемой блокировкой.
  * @note Объект должен жить в std::shared_ptr (см. create()): async-цепочка тиков
  *       удерживает себя через shared_from_this() и гарантирует деинициализацию
  *       только после завершения или отмены таймерного обработчика.
@@ -164,29 +160,16 @@ public:
     [[nodiscard]] std::uint64_t currentTick() const noexcept;
 
     /**
-     * @brief Возвращает последний опубликованный снимок состояния мира.
-     * @details Потокобезопасен: возвращает копию снимка под last_snapshot_mutex_.
-     * @return std::shared_ptr<const snapshot::GameSnapshot> Снимок состояния или nullptr,
-     *         если тики ещё не запускались.
+     * @brief Возвращает наибольшую свободную окружность игрового поля.
+     * @details Свободная окружность — окружность, целиком лежащая внутри мировых границ
+     *          и не пересекающаяся и не касающаяся ни одной живой сущности (учитываются
+     *          все типы, включая Bullet). Окружность с максимальным радиусом; при равенстве
+     *          радиусов выбирается ближайшая к началу координат.
+     * @return math::Circle Наибольшая свободная окружность. Если живых сущностей нет —
+     *         вписанная в мир окружность с центром в (0,0).
+     * @note Константен: читает entities_ — вызывать только в контексте тика (на tick_strand_).
      */
-    [[nodiscard]] std::shared_ptr<const snapshot::GameSnapshot> lastSnapshot() const;
-
-    /**
-     * @brief Возвращает до count свободных позиций внутри мировых границ.
-     * @details Свободная позиция — узел регулярной сетки, не пересекающийся ни с одной
-     *          живой сущностью мира (учитываются все типы, включая Bullet).
-     *          Границы мира берутся из world_width_/world_height_.
-     * @param count Входные данные: Максимальное число позиций (0 -> пустой результат).
-     * @param clearance Входные данные: Радиус «запретной» окружности кандидата, по умолчанию 30.0.
-     * @return std::vector<math::Vector2D> Свободные позиции (не более count).
-     * @note Константен: читает entities_ — вызывать
-     *       только в контексте тика (на tick_strand_).
-     * @todo TODO: реализовать поиск свободных позиций на регулярной сетке —
-     *       нужен для спавна кораблей новых игроков (spawnShips()).
-     * @note Потокобезопасен: читает entities_ под разделяемой блокировкой.
-     */
-    [[nodiscard]] std::vector<math::Vector2D> freePositions(std::size_t count,
-                                                            math::Scalar clearance = world::kDefaultClearance) const;
+    [[nodiscard]] math::Circle freePosition() const;
 
 private:
     /**
@@ -224,9 +207,6 @@ private:
      *             Приветственный снимок (с кораблями новичков) доставляет новым
      *             игрокам broadcast: их сессии уже в SessionRegistry к моменту
      *             рассылки, поэтому отдельная персональная рассылка не нужна.
-     * @details Исключения любого рода перехватываются и логируются, чтобы
-     *          одиночный сбой не остановил игровой цикл.
-     *        коллизии, поддержание популяции астероидов, сбор и рассылка снимка.
      * @details Исключения передаются в doTick(), чтобы частичный тик не считался
      *          завершённым.
      * @inputs Входных параметров нет.
@@ -319,8 +299,8 @@ private:
     /**
      * @brief Создаёт корабли новых игроков в свободных от объектов областях мира.
      * @details Вызывается в конце тика ПОСЛЕ расчёта физики и коллизий: корабль
-     *          появляется на свободной позиции (freePositions) и попадает в снимок
-     *          текущего тика, но в физике этого тика не участвует.
+     *          появляется в центре наибольшей свободной окружности (freePosition())
+     *          и попадает в снимок текущего тика, но в физике этого тика не участвует.
      * @param new_players Входные данные: Сессии новых игроков текущего тика.
      * @outputs Выходных значений нет.
      */
@@ -359,11 +339,56 @@ private:
      */
     void onClientDisconnected(const ClientDisconnectedEvent& event);
 
-    // TODO: реализовать остальные обработчики коллизий.
-    // void onCollision(domain::Entity& ship1, domain::Entity& ship2);
-    void onCollision(domain::Entity& ship, domain::Entity& asteroid);
-    // void onCollision(domain::Entity& proj, domain::Entity& ship);
-    // void onCollision(domain::Entity& proj, domain::Entity& asteroid);
+    bool mayCollide(types::EntityType a, types::EntityType b) const noexcept;
+    void dispatchCollision(domain::Entity& a, domain::Entity& b);
+
+    void onCollisionShipShip(domain::Entity& ship1, domain::Entity& ship2);
+    void onCollisionBulletShip(domain::Entity& proj, domain::Entity& ship);
+
+    /**
+     * @brief Собирает таблицу лидеров (топ-10 игроков по очкам).
+     * @return Вектор пар (ник, очки), отсортированный по убыванию.
+     */
+    [[nodiscard]] std::vector<snapshot::LeaderboardEntry> buildLeaderboard() const;
+
+    /**
+     * @brief Колбек для подписки на событие PlayerJoinEvent
+     * @details Создаёт ActionType::PlayerJoin и кладёт в очерердь
+     * @inputs Входные параметры: событие из шины PlayerJoinEvent
+     * @outputs Выходных значений нет.
+     */
+    void onPlayerJoin(const PlayerJoinEvent& event);
+
+    /**
+     * @brief Колбек для подписки на событие PlayerMoveEvent
+     * @details Создаёт ActionType::MoveAndShoot и кладёт в очерердь
+     * @inputs Входные параметры: событие из шины PlayerMoveEvent
+     * @outputs Выходных значений нет.
+     */
+    void onPlayerMove(const PlayerMoveEvent& event);
+
+    /**
+     * @brief Разрешает тестовому классу доступ к приватным данным WI
+     * @warning Используется только для тестов.
+     */
+    friend class WorldInstanceTestAccessor;
+    friend class TwoShipsShootTestAccessor;
+
+    void onCollisionShipAsteroid(domain::Entity& ship, domain::Entity& asteroid);
+    void onCollisionBulletAsteroid(domain::Entity& proj, domain::Entity& asteroid);
+
+    void reapDestroyedShips();
+
+    enum class GrowStatus { CanGrow, CannotFit, InvalidInput };
+    [[nodiscard]] GrowStatus tryGrowShip(math::Vector2D& position, math::Scalar radius) const noexcept;
+
+    /**
+     * @brief Колбек для подписки на событие ShotMessageEvent
+     * @details Создаёт ActionType::MoveAndShoot и кладёт в очередь
+     * @inputs Входные параметры: событие из шины ShotMessageEvent
+     * @outputs Выходных значений нет.
+     */
+    void onShotReceived(const ShotMessageEvent& event);
 
     std::atomic<std::uint64_t> current_tick_{0};    ///< Номер текущего тика
     ThreadSafeQueue<ActionEvent> action_queue_;     ///< Очередь действий игроков
@@ -373,13 +398,14 @@ private:
     boost::asio::strand<boost::asio::io_context::executor_type> tick_strand_;  ///< Сериализация всех операций цикла
     boost::asio::steady_timer tick_timer_;     ///< Таймер игровых тиков
     std::chrono::microseconds tick_interval_;  ///< Интервал одного тика
-    mutable std::shared_mutex entities_mutex_;  ///< Защита пула сущностей от внешних читателей
-    mutable std::mutex action_mutex_;         ///< Синхронизация enqueueAction() с остановкой
-    mutable std::mutex last_snapshot_mutex_;  ///< Защита последнего снимка мира
-    std::shared_ptr<const snapshot::GameSnapshot> last_snapshot_{nullptr};  ///< Последний опубликованный снимок
-    math::Scalar world_width_{world::kDefaultWidth};                        ///< Ширина мира
+    mutable std::mutex action_mutex_;          ///< Синхронизация enqueueAction() с остановкой
+    math::Scalar world_width_{world::kDefaultWidth};    ///< Ширина мира
     math::Scalar world_height_{world::kDefaultHeight};  ///< Высота мира
     std::atomic<State> state_{State::Stopped};  ///< Состояние жизненного цикла игрового цикла
     boost::signals2::scoped_connection sub_disconnect_;               ///< Подписка на ClientDisconnectedEvent
-    std::unordered_map<SessionId, types::EntityId> session_to_ship_;  ///< связь сессии и корябля
+    boost::signals2::scoped_connection sub_shoot_;                    ///< Подписка на выстрел
+    std::unordered_map<SessionId, types::EntityId> session_to_ship_;  ///< Связь сессии и корабля
+    boost::signals2::scoped_connection sub_player_join_;
+    asteroid_factory::AsteroidFactory asteroid_factory_;
+    boost::signals2::scoped_connection sub_player_move_;  // Подписка на движения клиента
 };
